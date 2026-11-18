@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Shutter – Bean-Fernauslöser</title>
+<style>
+  :root {
+    --bg: #1b2226; --panel: #263036; --ink: #eef2f3; --mute: #93a3aa;
+    --focus: #e3b341; --release: #d8503f; --ok: #5fbf8f;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font-family: "Avenir Next", "Segoe UI", system-ui, sans-serif;
+    display: flex; flex-direction: column; gap: 14px;
+    padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom));
+    max-width: 560px; margin: 0 auto;
+  }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  h1 { font-size: 1.25rem; margin: 0; font-weight: 650; }
+  #status { color: var(--mute); font-size: .9rem; }
+  #status.on { color: var(--ok); }
+  button { font: inherit; color: inherit; border: 0; cursor: pointer; touch-action: manipulation; }
+  #connect {
+    background: var(--panel); padding: 10px 16px; border-radius: 10px; border: 1px solid #3a474e;
+  }
+  #connect:focus-visible, .big:focus-visible, summary:focus-visible { outline: 3px solid #fff; outline-offset: 3px; }
+  main { flex: 1; display: grid; grid-template-rows: 1fr 1.6fr; gap: 14px; min-height: 300px; }
+  .big {
+    border-radius: 22px; font-size: 1.7rem; font-weight: 700; color: #14191c;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
+    transition: transform .08s, filter .08s;
+  }
+  .big small { font-size: .85rem; font-weight: 500; opacity: .75; }
+  .big:active, .big.fired { transform: scale(.97); filter: brightness(1.15); }
+  .big:disabled { opacity: .35; cursor: not-allowed; }
+  #focus { background: var(--focus); }
+  #release { background: var(--release); color: #fff; }
+  #msg { min-height: 1.3em; font-size: .9rem; color: var(--mute); }
+  #msg.err { color: #ff9b8e; }
+  details { background: var(--panel); border-radius: 12px; padding: 10px 14px; font-size: .9rem; }
+  summary { cursor: pointer; color: var(--mute); }
+  .row { display: flex; gap: 10px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+  label { display: flex; align-items: center; gap: 6px; }
+  input, select {
+    font: inherit; background: var(--bg); color: var(--ink); border: 1px solid #3a474e;
+    border-radius: 8px; padding: 6px 8px;
+  }
+  input[type=number] { width: 4.5em; }
+  pre { margin: 10px 0 0; max-height: 130px; overflow: auto; font-size: .78rem; color: var(--mute); white-space: pre-wrap; }
+  @media (prefers-reduced-motion: reduce) { .big { transition: none; } }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Shutter</h1>
+    <div id="status">Nicht verbunden</div>
+  </div>
+  <button id="connect">Bean verbinden</button>
+</header>
+
+<main>
+  <button class="big" id="focus" disabled>Fokussieren<small>Code 13</small></button>
+  <button class="big" id="release" disabled>Auslösen<small>Code 14</small></button>
+</main>
+<div id="msg" role="status"></div>
+
+<details>
+  <summary>Einstellungen und Protokoll</summary>
+  <div class="row">
+    <label>Fokus-Code <input id="codeFocus" type="number" min="0" max="255" value="13"></label>
+    <label>Auslöser-Code <input id="codeRelease" type="number" min="0" max="255" value="14"></label>
+  </div>
+  <div class="row">
+    <label>CRC-Byte-Reihenfolge
+      <select id="crcOrder">
+        <option value="le">Low-Byte zuerst (Standard)</option>
+        <option value="be">High-Byte zuerst</option>
+      </select>
+    </label>
+  </div>
+  <pre id="log"></pre>
+</details>
+
+<script>
+"use strict";
+// Bean-Serial-Transport: alles, was hier geschrieben wird, landet an Serial des ATmega
+// (57600 Baud) – genau dort, wo Shutter.ino mit readBytes() zwei Bytes erwartet.
+const SERVICE = "a495ff10-c5b1-4b44-b512-1370f02d74de";
+const SERIAL_CHAR = "a495ff11-c5b1-4b44-b512-1370f02d74de";
+
+const $ = id => document.getElementById(id);
+let device = null, characteristic = null, msgCount = 0, busy = false;
+
+function log(text) {
+  const el = $("log");
+  el.textContent = text + "\n" + el.textContent;
+}
+function setMsg(text, isErr) {
+  const el = $("msg");
+  el.textContent = text || "";
+  el.className = isErr ? "err" : "";
+}
+const hex = bytes => Array.from(bytes, b => b.toString(16).padStart(2, "0")).join(" ");
+
+// CRC-16/CCITT, Startwert 0xFFFF, Polynom 0x1021
+function crc16(bytes) {
+  let crc = 0xFFFF;
+  for (const b of bytes) {
+    crc ^= b << 8;
+    for (let i = 0; i < 8; i++) {
+      crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) & 0xFFFF : (crc << 1) & 0xFFFF;
+    }
+  }
+  return crc;
+}
+
+// GATT-Paket: [Kopf][Länge][0][Befehl-ID hi][Befehl-ID lo = 0 → Serial][Daten…][CRC]
+function buildPacket(data) {
+  const body = [data.length + 2, 0x00, 0x00, 0x00, ...data];
+  const crc = crc16(body);
+  const crcBytes = $("crcOrder").value === "be"
+    ? [crc >> 8, crc & 0xFF] : [crc & 0xFF, crc >> 8];
+  const header = 0x80 | ((msgCount & 0x03) << 5); // Start-Bit, Nachrichtenzähler, 0 Folgepakete
+  msgCount = (msgCount + 1) & 0x03;
+  return new Uint8Array([header, ...body, ...crcBytes]);
+}
+
+async function send(code, button) {
+  if (!characteristic || busy) return;
+  busy = true;
+  button.classList.add("fired");
+  try {
+    const packet = buildPacket([code, 0]); // wie die Sandbox: [Tasten-ID, Wert 0]
+    if (characteristic.writeValueWithoutResponse) {
+      await characteristic.writeValueWithoutResponse(packet);
+    } else {
+      await characteristic.writeValue(packet);
+    }
+    log("gesendet: " + hex(packet));
+    setMsg("");
+  } catch (e) {
+    setMsg("Senden fehlgeschlagen: " + e.message, true);
+  } finally {
+    setTimeout(() => button.classList.remove("fired"), 150);
+    busy = false;
+  }
+}
+
+function setConnected(on) {
+  $("status").textContent = on ? "Verbunden mit " + (device && device.name || "Bean") : "Nicht verbunden";
+  $("status").className = on ? "on" : "";
+  $("focus").disabled = $("release").disabled = !on;
+  $("connect").textContent = on ? "Trennen" : "Bean verbinden";
+}
+
+async function connect() {
+  if (!navigator.bluetooth) {
+    setMsg("Dieser Browser unterstützt Web Bluetooth nicht. Nutze Chrome oder Edge (Android, Windows, macOS, Linux) – auf dem iPhone z. B. den Browser Bluefy.", true);
+    return;
+  }
+  try {
+    setMsg("Suche nach der Bean …");
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE] }, { namePrefix: "Bean" }],
+      optionalServices: [SERVICE]
+    });
+    device.addEventListener("gattserverdisconnected", () => {
+      characteristic = null; setConnected(false); setMsg("Verbindung getrennt.");
+    });
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE);
+    characteristic = await service.getCharacteristic(SERIAL_CHAR);
+    msgCount = 0;
+    setConnected(true);
+    setMsg("");
+  } catch (e) {
+    setConnected(false);
+    setMsg(e.name === "NotFoundError" ? "Keine Bean ausgewählt." : "Verbindung fehlgeschlagen: " + e.message, true);
+  }
+}
+
+$("connect").addEventListener("click", () => {
+  if (device && device.gatt.connected) device.gatt.disconnect(); else connect();
+});
+$("focus").addEventListener("click", e => send(+$("codeFocus").value, e.currentTarget));
+$("release").addEventListener("click", e => send(+$("codeRelease").value, e.currentTarget));
+$("codeFocus").addEventListener("input", () => $("focus").lastElementChild.textContent = "Code " + $("codeFocus").value);
+$("codeRelease").addEventListener("input", () => $("release").lastElementChild.textContent = "Code " + $("codeRelease").value);
+</script>
+</body>
+</html>
